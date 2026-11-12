@@ -1,0 +1,29 @@
+# The whole stack locally: `docker compose up --build`.
+# Or only the database, for `./gradlew bootRun`: `docker compose up -d postgres`.
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: webhooks
+      POSTGRES_USER: webhooks
+      POSTGRES_PASSWORD: webhooks
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U webhooks -d webhooks"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
+  dispatcher:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_HOST: postgres
+      DISPATCHER_API_KEY: local-dev-key
+      # Lets local http endpoints subscribe; production only accepts https.
+      DISPATCHER_ALLOW_INSECURE_URLS: "true"
+    ports:
+      - "8080:8080"
