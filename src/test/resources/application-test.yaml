@@ -1,0 +1,22 @@
+dispatcher:
+  api-key: test-api-key
+  # Test receivers listen on http://127.0.0.1.
+  allow-insecure-urls: true
+  worker:
+    poll-interval: 50ms
+    lease: 30s
+    shutdown-timeout: 5s
+  retry:
+    max-attempts: 3
+    initial-backoff: 100ms
+    multiplier: 2.0
+    max-backoff: 500ms
+  http:
+    connect-timeout: 1s
+    response-timeout: 1s
+  circuit-breaker:
+    failure-rate-threshold: 50
+    minimum-number-of-calls: 4
+    sliding-window-size: 4
+    wait-duration-in-open-state: 1m
+    permitted-calls-in-half-open-state: 1
