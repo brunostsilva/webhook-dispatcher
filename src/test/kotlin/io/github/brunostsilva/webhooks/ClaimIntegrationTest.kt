@@ -2,6 +2,7 @@ package io.github.brunostsilva.webhooks
 
 import io.github.brunostsilva.webhooks.delivery.AttemptResult
 import io.github.brunostsilva.webhooks.delivery.DeliveryRepository
+import io.github.brunostsilva.webhooks.delivery.DeliveryService
 import io.github.brunostsilva.webhooks.delivery.DeliveryStatus
 import io.github.brunostsilva.webhooks.delivery.Transition
 import io.github.brunostsilva.webhooks.delivery.WebhookSigner
@@ -21,12 +22,15 @@ import org.junit.jupiter.api.Test
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.test.context.TestPropertySource
 
-/** The claim query and the claim token, on their own, with this context's worker off. */
+/** The claim query, the claim token and consistent reads, on their own, with this context's worker off. */
 @TestPropertySource(properties = ["dispatcher.worker.enabled=false"])
 class ClaimIntegrationTest : IntegrationTest() {
 
     @Autowired
     private lateinit var deliveries: DeliveryRepository
+
+    @Autowired
+    private lateinit var deliveryService: DeliveryService
 
     @Autowired
     private lateinit var events: EventRepository
@@ -117,6 +121,35 @@ class ClaimIntegrationTest : IntegrationTest() {
             assertThat(deliveries.complete(current, result, Transition.Delivered, later)).isTrue()
             assertThat(deliveries.attemptsOf(current.deliveryId)).hasSize(1)
             assertThat(deliveries.find(current.deliveryId)?.status).isEqualTo(DeliveryStatus.DELIVERED)
+        }
+    }
+
+    @Test
+    fun `a delivery and its history are read from the same snapshot, even while attempts are recorded`() {
+        runBlocking {
+            val eventId = createDeliveries(newSubscription(), 1).single()
+
+            // One coroutine records 50 attempts, one after the other, while the other keeps reading.
+            val writer = async(Dispatchers.IO) {
+                var now = future.plusSeconds(1)
+                for (attempt in 1..50) {
+                    val job = deliveries.claim(now, now.plusSeconds(30), noLimit, noLimit).single { it.eventId == eventId }
+                    val result = AttemptResult(number = attempt, statusCode = 503, error = null, duration = Duration.ofMillis(1))
+                    deliveries.complete(job, result, Transition.Retry(now), now)
+                    now = now.plusSeconds(1)
+                }
+            }
+            val inconsistentReads = mutableListOf<String>()
+            while (writer.isActive) {
+                val details = deliveryService.ofEvent(eventId).single()
+                if (details.attempts.size != details.delivery.attempts) {
+                    inconsistentReads += "${details.delivery.attempts} attempts, ${details.attempts.size} in the history"
+                }
+            }
+            writer.await()
+
+            assertThat(inconsistentReads).isEmpty()
+            assertThat(deliveryService.ofEvent(eventId).single().attempts).hasSize(50)
         }
     }
 

@@ -1,5 +1,6 @@
 package io.github.brunostsilva.webhooks.api
 
+import io.github.brunostsilva.webhooks.config.DispatcherProperties
 import io.github.brunostsilva.webhooks.delivery.DeliveryService
 import io.github.brunostsilva.webhooks.delivery.WorkerSignal
 import io.github.brunostsilva.webhooks.event.EventService
@@ -88,10 +89,30 @@ class EventController(
 
 @RestController
 @RequestMapping("/deliveries")
-class DeliveryController(private val deliveries: DeliveryService) {
+class DeliveryController(
+    private val deliveries: DeliveryService,
+    private val signal: WorkerSignal,
+    private val properties: DispatcherProperties,
+) {
+
+    private val log = LoggerFactory.getLogger(javaClass)
 
     /** Sends a FAILED or DEAD delivery again (e.g. once the subscriber fixed their endpoint). */
     @PostMapping("/{id}/retry")
-    suspend fun retry(@PathVariable id: UUID): ResponseEntity<DeliveryResponse> =
-        ResponseEntity.accepted().body(DeliveryResponse.of(deliveries.retry(id)))
+    suspend fun retry(@PathVariable id: UUID): ResponseEntity<DeliveryResponse> {
+        val details = deliveries.retry(id)
+        // The requeue is committed now: the worker can see it, and the log tells the truth.
+        signal.wake()
+        val delivery = details.delivery
+        log.atInfo()
+            .setMessage("Delivery {} of event {} requeued by hand, {} more attempt(s) allowed")
+            .addArgument(id)
+            .addArgument(delivery.eventId)
+            .addArgument(properties.retry.maxAttempts)
+            .addKeyValue("webhook.delivery_id", id)
+            .addKeyValue("webhook.event_id", delivery.eventId)
+            .addKeyValue("webhook.subscription_id", delivery.subscriptionId)
+            .log()
+        return ResponseEntity.accepted().body(DeliveryResponse.of(details))
+    }
 }
