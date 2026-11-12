@@ -40,14 +40,19 @@ flowchart LR
 1. **Publish.** `POST /events` stores the event and one `PENDING` delivery per matching subscription
    in the same transaction (the outbox), then answers `202 Accepted`. Nothing is sent inside the
    request: a slow merchant never slows producers down.
-2. **Claim.** Each instance runs a worker that claims due deliveries in batches with
-   `FOR UPDATE SKIP LOCKED`, setting them `IN_FLIGHT` with a lease. Any number of instances can run
-   it without sending a delivery twice; a delivery whose worker died is claimed again when its lease
-   expires. A new event wakes the local worker up immediately; other instances find it on their next
-   poll.
+2. **Claim.** Each instance runs a worker that claims due deliveries with `FOR UPDATE SKIP LOCKED`,
+   setting them `IN_FLIGHT` with a lease and a new **claim token**. Any number of instances can run it
+   without sending a delivery twice; a delivery whose worker died is claimed again, with a new token,
+   when its lease expires, and only the holder of the current token can renew the lease or record the
+   outcome: a worker that lost its claim can't overwrite the new owner's work. A new event wakes the
+   local worker up immediately; other instances find it on their next poll.
 3. **Deliver.** Deliveries run concurrently (coroutines), at most `max-concurrency` at a time and at
-   most `max-concurrency-per-subscription` per endpoint, so one slow merchant can't take every slot.
-   Each request is signed and has bounded connect and response timeouts; redirects are not followed.
+   most `max-concurrency-per-subscription` per endpoint. The worker only claims as many deliveries as
+   it has free slots, at most that per-endpoint limit for each endpoint and none for endpoints already
+   at their limit, and claims again as soon as a slot frees up: a slow merchant holds its own slots,
+   never anyone else's. The lease is renewed right before each request, so it covers the whole
+   attempt. Each request is signed and has bounded connect and response timeouts; redirects are not
+   followed.
 4. **Decide.** Every attempt goes into the delivery's history, and then:
 
 | Response | Next |
@@ -263,14 +268,17 @@ succeed, fail, time out or throttle):
 - **`DeliveryIntegrationTest`:** delivery to matching subscriptions only, with the Standard Webhooks
   headers and a signature checked against the subscription's secret; retries with backoff until
   success; a `400` not retried; a dead letter after the last attempt, then delivered by a manual
-  retry; `Retry-After` honoured; a timeout retried; an event nobody subscribed to.
+  retry; `Retry-After` honoured; a timeout retried; a slow endpoint with a backlog not holding up
+  deliveries to another endpoint; an event nobody subscribed to.
 - **`IdempotencyIntegrationTest`:** a repeated request returns the original event and delivers once; a
   key reused for a different request is a `422`; **10 concurrent requests** with the same key create
   a single event and a single delivery; the header is required.
 - **`CircuitBreakerIntegrationTest`:** an endpoint that keeps failing trips its breaker and stops being
   called, its deliveries wait without using up attempts, and a healthy endpoint gets every event.
 - **`ClaimIntegrationTest`:** concurrent claims never return the same delivery twice; a delivery whose
-  worker died is claimed again once its lease expires.
+  worker died is claimed again once its lease expires, with a new claim token; a worker that lost its
+  claim can't renew the lease, postpone the delivery or record an outcome (no history row either); a
+  claim takes at most the per-endpoint limit and nothing for busy endpoints.
 - **`ApiIntegrationTest`:** API key required; probes and Prometheus metrics open, with delivery and
   circuit breaker metrics; URL and event type validation; the secret only shown at creation; `404`s
   and `409` as problem details.
