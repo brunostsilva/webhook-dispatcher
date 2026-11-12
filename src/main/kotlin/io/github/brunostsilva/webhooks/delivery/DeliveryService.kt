@@ -8,6 +8,8 @@ import java.time.Clock
 import java.util.UUID
 import org.slf4j.LoggerFactory
 import org.springframework.stereotype.Service
+import org.springframework.transaction.annotation.Isolation
+import org.springframework.transaction.annotation.Transactional
 
 /** A delivery and its attempt history. */
 data class DeliveryDetails(val delivery: Delivery, val attempts: List<DeliveryAttempt>)
@@ -23,13 +25,24 @@ class DeliveryService(
 
     private val log = LoggerFactory.getLogger(javaClass)
 
+    /**
+     * The event's deliveries and their histories, from one snapshot of the database: with separate
+     * statements under READ COMMITTED, a worker finishing an attempt in between could make a delivery
+     * show up as DELIVERED after 3 attempts with only 2 of them in its history.
+     */
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
     suspend fun ofEvent(eventId: UUID): List<DeliveryDetails> {
         if (events.find(eventId) == null) throw NotFoundException("event", eventId)
         val attempts = deliveries.attemptsByEvent(eventId)
         return deliveries.findByEvent(eventId).map { DeliveryDetails(it, attempts[it.id].orEmpty()) }
     }
 
-    /** Sends a FAILED or DEAD delivery again, with a fresh budget of attempts. */
+    /**
+     * Sends a FAILED or DEAD delivery again, with a fresh budget of attempts. One transaction: the
+     * update keeps the row locked until commit (workers skip locked rows), so the delivery returned is
+     * exactly the one that was requeued.
+     */
+    @Transactional
     suspend fun retry(id: UUID): DeliveryDetails {
         if (!deliveries.retry(id, properties.retry.maxAttempts, clock.instant())) {
             val delivery = deliveries.find(id) ?: throw NotFoundException("delivery", id)
