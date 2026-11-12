@@ -1,0 +1,56 @@
+spring:
+  application:
+    name: webhook-dispatcher
+  r2dbc:
+    url: r2dbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:webhooks}
+    username: ${DB_USER:webhooks}
+    password: ${DB_PASSWORD:webhooks}
+  # Flyway migrates over JDBC before the application starts using R2DBC.
+  flyway:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:webhooks}
+    user: ${DB_USER:webhooks}
+    password: ${DB_PASSWORD:webhooks}
+  webflux:
+    problemdetails:
+      enabled: true
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+
+dispatcher:
+  # Required: clients send it in the X-Api-Key header.
+  api-key: ${DISPATCHER_API_KEY}
+  # Only https endpoints are accepted unless this is on (local development and tests).
+  allow-insecure-urls: false
+  worker:
+    enabled: true
+    poll-interval: 1s
+    batch-size: 50
+    lease: 60s
+    max-concurrency: 64
+    max-concurrency-per-subscription: 4
+    shutdown-timeout: 20s
+  retry:
+    max-attempts: 8
+    initial-backoff: 10s
+    multiplier: 3.0
+    max-backoff: 1h
+    max-retry-after: 6h
+  http:
+    connect-timeout: 3s
+    response-timeout: 10s
+  circuit-breaker:
+    failure-rate-threshold: 50
+    minimum-number-of-calls: 10
+    sliding-window-size: 20
+    wait-duration-in-open-state: 60s
+    permitted-calls-in-half-open-state: 2
