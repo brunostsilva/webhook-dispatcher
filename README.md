@@ -276,7 +276,8 @@ succeed, fail, time out or throttle):
   and `409` as problem details.
 - **`LoggingIntegrationTest` / `JsonLogsIntegrationTest`:** a delivery's log lines carry its ids and
   outcome but never the payload, the secret or the URL; retries are `INFO` and the dead letter `WARN`;
-  with the `json-logs` profile each line is an ECS JSON object with the event's own fields.
+  with the `json-logs` profile each line is an ECS JSON object with the event's own fields (in a JVM
+  of its own, the `jsonLogsTest` task, since logging is configured once per JVM).
 - **Unit tests:** the signature against the Standard Webhooks reference example; the retry policy
   (classification of every kind of response, backoff bounds with jitter, `Retry-After` parsing and
   caps); and `LoggingBackendTest` (SLF4J on Log4j2, driven by Spring Boot, with async loggers).

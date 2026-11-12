@@ -9,7 +9,12 @@ import org.springframework.boot.test.system.CapturedOutput
 import org.springframework.boot.test.system.OutputCaptureExtension
 import org.springframework.test.context.ActiveProfiles
 
-/** The `json-logs` profile (added to `test`): one ECS JSON object per line, with the events' own fields. */
+/**
+ * The `json-logs` profile (added to `test`): one ECS JSON object per line, with the events' own fields.
+ *
+ * Runs in its own JVM (the `jsonLogsTest` Gradle task): logging is configured once per JVM, by the
+ * first application context to start, so alongside the other tests it would keep their format.
+ */
 @ActiveProfiles("json-logs")
 @ExtendWith(OutputCaptureExtension::class)
 class JsonLogsIntegrationTest : IntegrationTest() {

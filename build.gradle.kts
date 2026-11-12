@@ -70,12 +70,33 @@ dependencies {
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
-tasks.test {
+tasks.withType<Test>().configureEach {
     useJUnitPlatform()
     testLogging {
         events("passed", "skipped", "failed")
         exceptionFormat = TestExceptionFormat.FULL
     }
+}
+
+// Logging is configured once per JVM, by the first application context, so the JSON logs test runs
+// in a JVM of its own, where the json-logs profile is the one that configures it.
+val jsonLogsTest = "*JsonLogsIntegrationTest"
+
+tasks.test {
+    filter { excludeTestsMatching(jsonLogsTest) }
+}
+
+val jsonLogsTestTask = tasks.register<Test>("jsonLogsTest") {
+    description = "Runs the JSON logs test in its own JVM."
+    group = LifecycleBasePlugin.VERIFICATION_GROUP
+    testClassesDirs = sourceSets.test.get().output.classesDirs
+    classpath = sourceSets.test.get().runtimeClasspath
+    filter { includeTestsMatching(jsonLogsTest) }
+    shouldRunAfter(tasks.test)
+}
+
+tasks.check {
+    dependsOn(jsonLogsTestTask)
 }
 
 tasks.bootJar {
