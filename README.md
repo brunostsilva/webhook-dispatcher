@@ -136,11 +136,73 @@ docker compose up --build           # or everything, from the Docker image
 | `DISPATCHER_API_KEY` | (required) | Key clients send in `X-Api-Key` |
 | `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | `localhost`, `5432`, `webhooks`, `webhooks`, `webhooks` | PostgreSQL |
 | `DISPATCHER_ALLOW_INSECURE_URLS` | `false` | Accept `http` endpoints (local development) |
-| `LOGGING_STRUCTURED_FORMAT_CONSOLE` | (unset) | `ecs` or `logstash` for JSON logs |
+| `SPRING_PROFILES_ACTIVE` | (none) | `json-logs` for one JSON (ECS) object per log line |
 
 Retry, worker, timeout and circuit breaker settings are under `dispatcher.*` in
 [`application.yaml`](src/main/resources/application.yaml), and can be overridden the same way (e.g.
 `DISPATCHER_RETRY_MAX_ATTEMPTS=10`).
+
+## Observability
+
+Everything is built on open formats (SLF4J, ECS JSON, Prometheus), with no vendor agent or SDK in the
+app: plugging in Grafana, Elastic, Datadog or New Relic is configuration, not code. Without the
+`json-logs` profile, the app writes readable lines to the console.
+
+### Logs
+
+Logging goes through **SLF4J** with **Log4j2** instead of Spring Boot's default Logback, and every
+logger is **asynchronous** (Log4j2 async loggers on the LMAX Disruptor): a log call only puts the
+event on an in-memory ring buffer, and a background thread formats and writes it. The event-loop and
+coroutine threads of a WebFlux application never block on log I/O. If output can't keep up and the
+buffer fills, `INFO` and `DEBUG` lines are dropped rather than slowing callers down; `WARN` and
+`ERROR` are always kept ([`log4j2.component.properties`](src/main/resources/log4j2.component.properties)).
+`LoggingBackendTest` guards the setup.
+
+What gets logged, once per event, where it happens:
+
+| Event | Level | Example |
+|---|---|---|
+| Subscription created | `INFO` | `Subscription 5c1e… created for [payment.succeeded] on api.merchant.com` |
+| Event published / replayed | `INFO` | `Event 0b9b… of type payment.succeeded published with 2 delivery(ies)` |
+| `Idempotency-Key` reused for another request | `WARN` | `Idempotency-Key of event 0b9b… reused for a different request: rejected` |
+| Delivered | `INFO` | `Delivery 7f3a… of event 0b9b… to subscription 5c1e… delivered on attempt 1 (HTTP 200, 84 ms)` |
+| Attempt failed, retry scheduled | `INFO` | `… failed on attempt 2 (HTTP 503, 12 ms), retrying at 2026-11-12T10:00:31Z` |
+| Refused (client error) | `WARN` | `… refused on attempt 1 (HTTP 410, 9 ms), not retried` |
+| Dead letter | `WARN` | `… gave up after attempt 8 (Connection refused, 3 ms)` |
+| Circuit opened / half-open / closed | `WARN` / `INFO` | `Circuit for subscription 5c1e… went from CLOSED to OPEN` |
+| Delivery retried by hand | `INFO` | `Delivery 7f3a… of event 0b9b… requeued by hand, 8 more attempt(s) allowed` |
+| Worker started / stopped, batch errors | `INFO` / `ERROR` | `Delivery worker started` |
+
+- **No sensitive data:** payloads, signing secrets, full endpoint URLs (their path or query can carry
+  tokens) and idempotency keys are never logged; only ids, event types, hosts, statuses, HTTP codes,
+  attempts and durations. `LoggingIntegrationTest` asserts it.
+- **Structured fields:** events use SLF4J 2's fluent API (`addKeyValue`), so `webhook.event_id`,
+  `webhook.delivery_id`, `webhook.subscription_id`, `webhook.attempt`, `webhook.delivery_status`,
+  `webhook.duration_ms`, `http.response.status_code`… are separate fields in JSON output, ready to
+  filter and aggregate, instead of being parsed out of the message.
+
+**JSON logs.** The `json-logs` profile switches the console to one JSON object per line in
+[Elastic Common Schema](https://www.elastic.co/guide/en/ecs/current/index.html), which most log
+backends and shippers read as is:
+
+```bash
+SPRING_PROFILES_ACTIVE=json-logs DISPATCHER_API_KEY=local-dev-key ./gradlew bootRun
+```
+
+### Metrics
+
+`/actuator/prometheus` exposes, in the Prometheus text format:
+
+| Metric | Type | Tags | Meaning |
+|---|---|---|---|
+| `webhook_delivery_attempts_seconds` | timer | `outcome` (`delivered`, `retry`, `failed`, `dead`) | Every HTTP attempt and its duration |
+| `webhook_delivery_postponed_total` | counter | | Deliveries held back because their endpoint's circuit was open |
+| `resilience4j_circuitbreaker_state`, `…_calls_seconds`, `…_failure_rate` | gauges, timers | `name` (subscription id), `state`, `kind` | Circuit breaker of each endpoint |
+| `http_server_requests_seconds`, `jvm_*`, `r2dbc_pool_*` … | | | Spring Boot defaults |
+
+Delivery metrics never carry ids or URLs, so their number of series stays bounded. Circuit breaker
+metrics are tagged with the subscription id: one set per subscriber, which is what lets an alert say
+*which* endpoint is down.
 
 ## Production readiness
 
@@ -150,9 +212,9 @@ Retry, worker, timeout and circuit breaker settings are under `dispatcher.*` in
   deliveries from dead instances.
 - **Graceful shutdown:** the worker stops claiming and lets the current batch finish (up to
   `shutdown-timeout`); the web server drains requests.
-- **Observability:** `webhook.delivery.attempts` (timer by outcome), `webhook.delivery.postponed`,
-  Resilience4j circuit breaker state and calls, HTTP server metrics, liveness and readiness probes,
-  and optional structured JSON logs. Metric tags never include URLs, to keep cardinality bounded.
+- **Observability:** asynchronous Log4j2 logs with structured fields and optional ECS JSON output,
+  Prometheus metrics for deliveries and circuit breakers, liveness and readiness probes (see
+  [Observability](#observability)).
 - **Security:** API key compared in constant time; `https`-only endpoints in production; no
   redirects followed; endpoint credentials in URLs rejected; secrets never logged or returned after
   creation; the container runs as a non-root user.
@@ -212,8 +274,12 @@ succeed, fail, time out or throttle):
 - **`ApiIntegrationTest`:** API key required; probes and Prometheus metrics open, with delivery and
   circuit breaker metrics; URL and event type validation; the secret only shown at creation; `404`s
   and `409` as problem details.
-- **Unit tests:** the signature against the Standard Webhooks reference example, and the retry policy
-  (classification of every kind of response, backoff bounds with jitter, `Retry-After` parsing and caps).
+- **`LoggingIntegrationTest` / `JsonLogsIntegrationTest`:** a delivery's log lines carry its ids and
+  outcome but never the payload, the secret or the URL; retries are `INFO` and the dead letter `WARN`;
+  with the `json-logs` profile each line is an ECS JSON object with the event's own fields.
+- **Unit tests:** the signature against the Standard Webhooks reference example; the retry policy
+  (classification of every kind of response, backoff bounds with jitter, `Retry-After` parsing and
+  caps); and `LoggingBackendTest` (SLF4J on Log4j2, driven by Spring Boot, with async loggers).
 
 CI runs the build and tests on Java 27 and builds the Docker image; Dependabot keeps Gradle
 dependencies (including the wrapper), GitHub Actions and Docker images up to date.
@@ -221,7 +287,7 @@ dependencies (including the wrapper), GitHub Actions and Docker images up to dat
 ## Tech stack
 
 Kotlin 2.4 · Java 27 · Spring Boot 4.1 (WebFlux, coroutines) · R2DBC · PostgreSQL 18 · Flyway ·
-Resilience4j · Micrometer / Prometheus · Testcontainers · JUnit 5 · AssertJ · Gradle 9 (Kotlin DSL,
+Resilience4j · SLF4J / Log4j2 (async loggers) · Micrometer / Prometheus · Testcontainers · JUnit 5 · AssertJ · Gradle 9 (Kotlin DSL,
 version catalog) · Docker · GitHub Actions · Dependabot
 
 ## License
