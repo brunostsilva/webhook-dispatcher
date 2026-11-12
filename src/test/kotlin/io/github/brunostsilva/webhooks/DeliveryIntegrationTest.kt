@@ -6,6 +6,7 @@ import java.time.Instant
 import java.util.concurrent.atomic.AtomicBoolean
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.within
+import org.awaitility.Awaitility.await
 import org.junit.jupiter.api.Test
 import org.springframework.test.web.reactive.server.expectBody
 
@@ -117,6 +118,23 @@ class DeliveryIntegrationTest : IntegrationTest() {
         val timedOut = history(delivery).first()
         assertThat(timedOut["statusCode"]).isNull()
         assertThat(timedOut["error"] as String?).isNotBlank()
+    }
+
+    @Test
+    fun `a slow endpoint doesn't hold up deliveries to the others`() {
+        val slow = receiver { TestReceiver.Reply(200, delay = Duration.ofMillis(600)) }
+        val fast = receiver()
+        subscribe(slow.url, "slow.endpoint")
+        subscribe(fast.url, "fast.endpoint")
+        repeat(12) { publishAccepted("slow.endpoint") }
+        await().atMost(Duration.ofSeconds(10)).until { slow.requests.isNotEmpty() }
+
+        awaitDelivery(publishAccepted("fast.endpoint")) { it["status"] == "DELIVERED" }
+
+        // 12 deliveries, 4 at a time (max-concurrency-per-subscription), 600ms each, take about 1.8s:
+        // the fast endpoint's delivery went through while the slow endpoint's backlog was still going.
+        assertThat(slow.requests.size).isLessThan(12)
+        await().atMost(Duration.ofSeconds(10)).until { slow.requests.size == 12 }
     }
 
     @Test

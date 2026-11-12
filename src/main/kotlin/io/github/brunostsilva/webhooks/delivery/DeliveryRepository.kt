@@ -38,28 +38,52 @@ class DeliveryRepository(private val db: DatabaseClient) {
     }
 
     /**
-     * Claims up to `limit` deliveries that are due, or whose worker's lease expired (it crashed or
-     * was killed mid-attempt), and leases them until `leaseUntil`. `FOR UPDATE SKIP LOCKED` lets any
-     * number of workers, in any number of instances, claim at the same time without ever getting the
-     * same delivery.
+     * Claims up to `limit` deliveries that are due, or whose worker's lease expired (it crashed or was
+     * killed mid-attempt), and leases them until `leaseUntil`. `FOR UPDATE SKIP LOCKED` lets any number
+     * of workers, in any number of instances, claim at the same time without getting the same delivery.
+     *
+     * Each claim gets a new `claim_id`: only the worker holding it can renew the lease or record the
+     * outcome, so a worker whose lease expired can't overwrite the one that took the delivery over.
+     *
+     * At most `perSubscription` deliveries per subscription are claimed, and none for the `busy`
+     * subscriptions (those already sending as much as they're allowed to in this instance), so what's
+     * claimed can start right away and a slow endpoint's backlog doesn't crowd out the others.
      */
-    suspend fun claim(now: Instant, leaseUntil: Instant, limit: Int): List<DeliveryJob> =
+    suspend fun claim(
+        now: Instant,
+        leaseUntil: Instant,
+        limit: Int,
+        perSubscription: Int,
+        busy: Collection<UUID> = emptyList(),
+    ): List<DeliveryJob> =
         db.sql(
             """
-            with claimed as (
-                update deliveries
-                set status = 'IN_FLIGHT', lease_until = :leaseUntil, updated_at = :now
-                where id in (
-                    select id from deliveries
-                    where (status = 'PENDING' and next_attempt_at <= :now)
-                       or (status = 'IN_FLIGHT' and lease_until < :now)
-                    order by next_attempt_at
-                    limit :limit
-                    for update skip locked
-                )
-                returning id, event_id, subscription_id, attempts, attempt_limit
+            with candidates as (
+                select id, subscription_id, next_attempt_at from deliveries
+                where ((status = 'PENDING' and next_attempt_at <= :now) or (status = 'IN_FLIGHT' and lease_until < :now))
+                  and subscription_id::text <> all(:busy)
+                order by next_attempt_at
+                limit :scan
+                for update skip locked
+            ),
+            picked as (
+                select id from (
+                    select id, next_attempt_at,
+                           row_number() over (partition by subscription_id order by next_attempt_at) as position
+                    from candidates
+                ) ranked
+                where position <= :perSubscription
+                order by next_attempt_at
+                limit :limit
+            ),
+            claimed as (
+                update deliveries d
+                set status = 'IN_FLIGHT', lease_until = :leaseUntil, claim_id = gen_random_uuid(), updated_at = :now
+                from picked
+                where d.id = picked.id
+                returning d.id, d.event_id, d.subscription_id, d.attempts, d.attempt_limit, d.claim_id
             )
-            select c.id, c.event_id, c.subscription_id, c.attempts, c.attempt_limit, e.payload, s.url, s.secret
+            select c.id, c.event_id, c.subscription_id, c.attempts, c.attempt_limit, c.claim_id, e.payload, s.url, s.secret
             from claimed c
             join events e on e.id = c.event_id
             join subscriptions s on s.id = c.subscription_id
@@ -68,9 +92,13 @@ class DeliveryRepository(private val db: DatabaseClient) {
             .bind("now", now)
             .bind("leaseUntil", leaseUntil)
             .bind("limit", limit)
+            .bind("scan", limit * SCAN_FACTOR)
+            .bind("perSubscription", perSubscription)
+            .bind("busy", busy.map(UUID::toString).toTypedArray())
             .map { row, _ ->
                 DeliveryJob(
                     deliveryId = row.uuid("id"),
+                    claimId = row.uuid("claim_id"),
                     eventId = row.uuid("event_id"),
                     subscriptionId = row.uuid("subscription_id"),
                     url = row.string("url"),
@@ -82,23 +110,64 @@ class DeliveryRepository(private val db: DatabaseClient) {
             }
             .all().collectList().awaitSingle()
 
-    /** Gives a claimed delivery back without attempting it, e.g. while its endpoint's circuit is open. */
-    suspend fun postpone(id: UUID, until: Instant, now: Instant) {
+    /**
+     * Extends the lease of a claimed delivery right before it's sent. False if the claim was lost (the
+     * lease expired and another worker took the delivery over): it must not be sent then.
+     */
+    suspend fun renewLease(job: DeliveryJob, leaseUntil: Instant, now: Instant): Boolean =
         db.sql(
             """
-            update deliveries set status = 'PENDING', next_attempt_at = :until, lease_until = null, updated_at = :now
-            where id = :id and status = 'IN_FLIGHT'
+            update deliveries set lease_until = :leaseUntil, updated_at = :now
+            where id = :id and claim_id = :claimId and status = 'IN_FLIGHT'
             """,
         )
-            .bind("id", id)
+            .bind("id", job.deliveryId)
+            .bind("claimId", job.claimId)
+            .bind("leaseUntil", leaseUntil)
+            .bind("now", now)
+            .fetch().rowsUpdated().awaitSingle() == 1L
+
+    /** Gives a claimed delivery back without attempting it, e.g. while its endpoint's circuit is open. */
+    suspend fun postpone(job: DeliveryJob, until: Instant, now: Instant): Boolean =
+        db.sql(
+            """
+            update deliveries
+            set status = 'PENDING', next_attempt_at = :until, lease_until = null, claim_id = null, updated_at = :now
+            where id = :id and claim_id = :claimId and status = 'IN_FLIGHT'
+            """,
+        )
+            .bind("id", job.deliveryId)
+            .bind("claimId", job.claimId)
             .bind("until", until)
             .bind("now", now)
-            .fetch().rowsUpdated().awaitSingle()
-    }
+            .fetch().rowsUpdated().awaitSingle() == 1L
 
-    /** Records an attempt in the history and moves the delivery on, atomically. */
+    /**
+     * Moves the delivery on and records the attempt in its history, atomically, if this worker still
+     * holds the claim. False (and nothing recorded) if the claim was lost in the meantime.
+     */
     @Transactional
-    suspend fun complete(job: DeliveryJob, attempt: AttemptResult, transition: Transition, now: Instant) {
+    suspend fun complete(job: DeliveryJob, attempt: AttemptResult, transition: Transition, now: Instant): Boolean {
+        val nextAttemptAt = if (transition is Transition.Retry) transition.at else now
+        val updated = db.sql(
+            """
+            update deliveries
+            set status = :status, attempts = :attempts, next_attempt_at = :nextAttemptAt, lease_until = null,
+                claim_id = null, last_status_code = :statusCode, last_error = :error, updated_at = :now
+            where id = :id and claim_id = :claimId and status = 'IN_FLIGHT'
+            """,
+        )
+            .bind("id", job.deliveryId)
+            .bind("claimId", job.claimId)
+            .bind("status", transition.status.name)
+            .bind("attempts", attempt.number)
+            .bind("nextAttemptAt", nextAttemptAt)
+            .bindNullable("statusCode", attempt.statusCode, Int::class.javaObjectType)
+            .bindNullable("error", attempt.error, String::class.java)
+            .bind("now", now)
+            .fetch().rowsUpdated().awaitSingle()
+        if (updated != 1L) return false
+
         db.sql(
             """
             insert into delivery_attempts (delivery_id, attempt, status_code, error, duration_ms, attempted_at)
@@ -112,24 +181,7 @@ class DeliveryRepository(private val db: DatabaseClient) {
             .bind("durationMs", attempt.duration.toMillis())
             .bind("now", now)
             .fetch().rowsUpdated().awaitSingle()
-
-        val nextAttemptAt = if (transition is Transition.Retry) transition.at else now
-        db.sql(
-            """
-            update deliveries
-            set status = :status, attempts = :attempts, next_attempt_at = :nextAttemptAt, lease_until = null,
-                last_status_code = :statusCode, last_error = :error, updated_at = :now
-            where id = :id and status = 'IN_FLIGHT'
-            """,
-        )
-            .bind("id", job.deliveryId)
-            .bind("status", transition.status.name)
-            .bind("attempts", attempt.number)
-            .bind("nextAttemptAt", nextAttemptAt)
-            .bindNullable("statusCode", attempt.statusCode, Int::class.javaObjectType)
-            .bindNullable("error", attempt.error, String::class.java)
-            .bind("now", now)
-            .fetch().rowsUpdated().awaitSingle()
+        return true
     }
 
     /** Puts a FAILED or DEAD delivery back in the queue with a new budget of attempts. */
@@ -206,4 +258,9 @@ class DeliveryRepository(private val db: DatabaseClient) {
         durationMs = long("duration_ms"),
         attemptedAt = instant("attempted_at"),
     )
+
+    private companion object {
+        /** Candidate rows looked at per delivery claimed, so the per-subscription cap still fills a claim. */
+        const val SCAN_FACTOR = 4
+    }
 }

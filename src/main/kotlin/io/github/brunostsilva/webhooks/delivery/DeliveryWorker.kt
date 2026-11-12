@@ -22,12 +22,13 @@ import org.springframework.context.SmartLifecycle
 import org.springframework.stereotype.Component
 
 /**
- * Claims due deliveries in batches and processes them concurrently: at most `max-concurrency` at a
- * time, and at most `max-concurrency-per-subscription` per endpoint, so one slow endpoint can't take
- * every slot. Any number of instances can run it (see [DeliveryRepository.claim]).
+ * Keeps up to `max-concurrency` deliveries in flight, at most `max-concurrency-per-subscription` per
+ * endpoint. It claims only as many deliveries as it has free slots, skipping endpoints already at
+ * their limit, and claims again as soon as a slot frees up: a slow endpoint holds its own slots, never
+ * the others'. Any number of instances can run it (see [DeliveryRepository.claim]).
  *
- * On shutdown it stops claiming and lets the current batch finish, up to `shutdown-timeout`; whatever
- * is still in flight after that is cancelled and claimed again once its lease expires.
+ * On shutdown it stops claiming and lets in-flight deliveries finish, up to `shutdown-timeout`;
+ * whatever is still running after that is cancelled and claimed again once its lease expires.
  */
 @Component
 class DeliveryWorker(
@@ -73,38 +74,43 @@ class DeliveryWorker(
 
     override fun isRunning(): Boolean = loop?.isActive == true
 
-    private suspend fun run() {
+    /** Returns once stopping and every delivery it started has finished. */
+    private suspend fun run(): Unit = coroutineScope {
         while (!stopping) {
-            val claimed = try {
-                processBatch()
-            } catch (cancellation: CancellationException) {
-                throw cancellation
-            } catch (error: Exception) {
-                log.error("Delivery batch failed, retrying after the poll interval", error)
-                0
-            }
-            // A full batch means more may be waiting: claim again right away.
-            if (claimed < settings.batchSize && !stopping) signal.await(settings.pollInterval)
-        }
-    }
-
-    private suspend fun processBatch(): Int {
-        val now = clock.instant()
-        val batch = deliveries.claim(now, now.plus(settings.lease), settings.batchSize)
-        coroutineScope {
-            for (job in batch) {
+            val capacity = minOf(settings.batchSize, slots.availablePermits)
+            val claimed = if (capacity > 0) claim(capacity) else emptyList()
+            for (job in claimed) {
+                // Reserved before launching, so there are never more than max-concurrency in flight.
+                slots.acquire()
                 launch {
-                    val endpoint = endpointSlots.computeIfAbsent(job.subscriptionId) {
-                        Semaphore(settings.maxConcurrencyPerSubscription)
-                    }
-                    endpoint.withPermit {
-                        slots.withPermit { processSafely(job) }
+                    try {
+                        endpointSlot(job.subscriptionId).withPermit { processSafely(job) }
+                    } finally {
+                        slots.release()
+                        signal.wake() // a slot is free: claim again without waiting for the poll interval
                     }
                 }
             }
+            // A full claim means more may be due: claim again right away. Otherwise wait for a new
+            // event, a freed slot or the poll interval.
+            if (capacity == 0 || claimed.size < capacity) signal.await(settings.pollInterval)
         }
-        return batch.size
     }
+
+    private suspend fun claim(capacity: Int): List<DeliveryJob> =
+        try {
+            val now = clock.instant()
+            val busy = endpointSlots.filterValues { it.availablePermits == 0 }.keys
+            deliveries.claim(now, now.plus(settings.lease), capacity, settings.maxConcurrencyPerSubscription, busy)
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (error: Exception) {
+            log.error("Claiming deliveries failed, retrying after the poll interval", error)
+            emptyList()
+        }
+
+    private fun endpointSlot(subscriptionId: UUID): Semaphore =
+        endpointSlots.computeIfAbsent(subscriptionId) { Semaphore(settings.maxConcurrencyPerSubscription) }
 
     private suspend fun processSafely(job: DeliveryJob) {
         try {

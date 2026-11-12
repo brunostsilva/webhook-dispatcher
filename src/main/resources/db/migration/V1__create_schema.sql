@@ -29,6 +29,8 @@ create table deliveries (
     next_attempt_at  timestamptz not null,
     -- Until when the worker that claimed an IN_FLIGHT delivery owns it; after that it can be claimed again.
     lease_until      timestamptz,
+    -- Token of the current claim: only the worker holding it can renew the lease or record the outcome.
+    claim_id         uuid,
     last_status_code int,
     last_error       text,
     created_at       timestamptz not null,

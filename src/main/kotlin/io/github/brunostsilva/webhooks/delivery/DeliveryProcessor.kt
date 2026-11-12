@@ -22,11 +22,25 @@ class DeliveryProcessor(
     private val log = LoggerFactory.getLogger(javaClass)
 
     suspend fun process(job: DeliveryJob) {
+        // The lease ran from the claim; it's renewed now that the delivery is about to be sent, so it
+        // covers the whole attempt. If the claim was lost meanwhile (the lease expired and another
+        // worker took the delivery over), it isn't sent: that worker sends it.
+        val start = clock.instant()
+        if (!deliveries.renewLease(job, start.plus(properties.worker.lease), start)) {
+            log.atInfo()
+                .setMessage("Delivery {} of event {} was taken over by another worker before being sent: skipped")
+                .addArgument(job.deliveryId)
+                .addArgument(job.eventId)
+                .addKeyValue("webhook.delivery_id", job.deliveryId)
+                .addKeyValue("webhook.event_id", job.eventId)
+                .log()
+            return
+        }
+
         val breaker = breakers.forSubscription(job.subscriptionId)
         if (!breaker.tryAcquirePermission()) {
             // The endpoint is known to be down: hand the delivery back without using up an attempt.
-            val now = clock.instant()
-            deliveries.postpone(job.deliveryId, now.plus(properties.circuitBreaker.waitDurationInOpenState), now)
+            deliveries.postpone(job, start.plus(properties.circuitBreaker.waitDurationInOpenState), start)
             metrics.postponed()
             log.debug("Circuit open for subscription {}, postponed delivery {}", job.subscriptionId, job.deliveryId)
             return
@@ -62,7 +76,19 @@ class DeliveryProcessor(
             error = (response as? WebhookResponse.Failure)?.error?.take(MAX_ERROR_LENGTH),
             duration = duration,
         )
-        deliveries.complete(job, result, transition, now)
+        if (!deliveries.complete(job, result, transition, now)) {
+            // Can only happen if the attempt outlived its lease: the outcome belongs to the new owner.
+            log.atWarn()
+                .setMessage("Delivery {} of event {} lost its claim during attempt {} ({}): outcome not recorded")
+                .addArgument(job.deliveryId)
+                .addArgument(job.eventId)
+                .addArgument(attempt)
+                .addArgument(response.describe())
+                .addKeyValue("webhook.delivery_id", job.deliveryId)
+                .addKeyValue("webhook.event_id", job.eventId)
+                .log()
+            return
+        }
         metrics.attempt(transition, duration)
 
         logAttempt(job, attempt, response, duration, transition)

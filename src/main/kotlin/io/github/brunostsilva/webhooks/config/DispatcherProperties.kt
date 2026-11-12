@@ -15,6 +15,10 @@ data class DispatcherProperties(
 ) {
     init {
         require(apiKey.isNotBlank()) { "dispatcher.api-key must be set" }
+        // The lease is renewed when an attempt starts, and must outlast it.
+        require(worker.lease > http.connectTimeout + http.responseTimeout) {
+            "dispatcher.worker.lease must be longer than dispatcher.http.connect-timeout + response-timeout"
+        }
     }
 
     data class Worker(

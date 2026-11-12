@@ -46,6 +46,8 @@ data class DeliveryAttempt(
 /** A delivery claimed by a worker, with everything needed to send it. */
 data class DeliveryJob(
     val deliveryId: UUID,
+    /** This claim's token: the worker must still hold it to renew the lease or record the outcome. */
+    val claimId: UUID,
     val eventId: UUID,
     val subscriptionId: UUID,
     val url: String,
