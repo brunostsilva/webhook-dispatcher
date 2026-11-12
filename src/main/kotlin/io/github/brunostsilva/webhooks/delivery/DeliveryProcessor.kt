@@ -65,16 +65,36 @@ class DeliveryProcessor(
         deliveries.complete(job, result, transition, now)
         metrics.attempt(transition, duration)
 
-        when (transition) {
-            Transition.Dead -> log.warn(
-                "Delivery {} of event {} gave up after {} attempts: {}",
-                job.deliveryId, job.eventId, attempt, response.describe(),
-            )
-            Transition.Failed -> log.warn(
-                "Delivery {} of event {} was refused: {}", job.deliveryId, job.eventId, response.describe(),
-            )
-            else -> log.debug("Delivery {} attempt {}: {}", job.deliveryId, attempt, response.describe())
+        logAttempt(job, attempt, response, duration, transition)
+    }
+
+    /** One line per attempt: INFO when delivered or retried, WARN when refused or given up. */
+    private fun logAttempt(job: DeliveryJob, attempt: Int, response: WebhookResponse, duration: Duration, transition: Transition) {
+        val event = when (transition) {
+            Transition.Delivered -> log.atInfo()
+                .setMessage("Delivery {} of event {} to subscription {} delivered on attempt {} ({}, {} ms)")
+            is Transition.Retry -> log.atInfo()
+                .setMessage("Delivery {} of event {} to subscription {} failed on attempt {} ({}, {} ms), retrying at {}")
+            Transition.Failed -> log.atWarn()
+                .setMessage("Delivery {} of event {} to subscription {} refused on attempt {} ({}, {} ms), not retried")
+            Transition.Dead -> log.atWarn()
+                .setMessage("Delivery {} of event {} to subscription {} gave up after attempt {} ({}, {} ms)")
         }
+        event.addArgument(job.deliveryId)
+            .addArgument(job.eventId)
+            .addArgument(job.subscriptionId)
+            .addArgument(attempt)
+            .addArgument(response.describe())
+            .addArgument(duration.toMillis())
+        if (transition is Transition.Retry) event.addArgument(transition.at)
+        event.addKeyValue("webhook.delivery_id", job.deliveryId)
+            .addKeyValue("webhook.event_id", job.eventId)
+            .addKeyValue("webhook.subscription_id", job.subscriptionId)
+            .addKeyValue("webhook.attempt", attempt)
+            .addKeyValue("webhook.delivery_status", transition.status)
+            .addKeyValue("webhook.duration_ms", duration.toMillis())
+        if (response is WebhookResponse.Status) event.addKeyValue("http.response.status_code", response.code)
+        event.log()
     }
 
     private fun WebhookResponse.describe(): String = when (this) {

@@ -6,6 +6,7 @@ import io.github.brunostsilva.webhooks.config.DispatcherProperties
 import io.github.brunostsilva.webhooks.event.EventRepository
 import java.time.Clock
 import java.util.UUID
+import org.slf4j.LoggerFactory
 import org.springframework.stereotype.Service
 
 /** A delivery and its attempt history. */
@@ -19,6 +20,8 @@ class DeliveryService(
     private val clock: Clock,
     private val properties: DispatcherProperties,
 ) {
+
+    private val log = LoggerFactory.getLogger(javaClass)
 
     suspend fun ofEvent(eventId: UUID): List<DeliveryDetails> {
         if (events.find(eventId) == null) throw NotFoundException("event", eventId)
@@ -34,6 +37,15 @@ class DeliveryService(
         }
         signal.wake()
         val delivery = checkNotNull(deliveries.find(id)) { "delivery $id disappeared" }
+        log.atInfo()
+            .setMessage("Delivery {} of event {} requeued by hand, {} more attempt(s) allowed")
+            .addArgument(id)
+            .addArgument(delivery.eventId)
+            .addArgument(properties.retry.maxAttempts)
+            .addKeyValue("webhook.delivery_id", id)
+            .addKeyValue("webhook.event_id", delivery.eventId)
+            .addKeyValue("webhook.subscription_id", delivery.subscriptionId)
+            .log()
         return DeliveryDetails(delivery, deliveries.attemptsOf(id))
     }
 }

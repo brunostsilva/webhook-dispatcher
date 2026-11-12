@@ -8,6 +8,7 @@ import java.net.URI
 import java.net.URISyntaxException
 import java.time.Clock
 import java.util.UUID
+import org.slf4j.LoggerFactory
 import org.springframework.stereotype.Service
 
 @Service
@@ -17,21 +18,33 @@ class SubscriptionService(
     private val properties: DispatcherProperties,
 ) {
 
+    private val log = LoggerFactory.getLogger(javaClass)
+
     /** Registers an endpoint. The returned subscription carries its signing secret, shown only once. */
     suspend fun create(url: String, eventTypes: List<String>): Subscription {
-        validateUrl(url)
+        val host = validateUrl(url).host
         val types = eventTypes.map(String::trim).distinct()
         if (types.isEmpty() || types.any { it.isEmpty() || it.length > MAX_EVENT_TYPE_LENGTH }) {
             throw InvalidRequestException("eventTypes must list 1 or more types of up to $MAX_EVENT_TYPE_LENGTH characters")
         }
         val subscription = Subscription(UUID.randomUUID(), url, WebhookSigner.newSecret(), types, clock.instant())
         subscriptions.insert(subscription)
+        // Only the host: a URL's path or query can carry tokens.
+        log.atInfo()
+            .setMessage("Subscription {} created for {} on {}")
+            .addArgument(subscription.id)
+            .addArgument(types)
+            .addArgument(host)
+            .addKeyValue("webhook.subscription_id", subscription.id)
+            .addKeyValue("webhook.event_types", types.size)
+            .addKeyValue("url.domain", host)
+            .log()
         return subscription
     }
 
     suspend fun get(id: UUID): Subscription = subscriptions.find(id) ?: throw NotFoundException("subscription", id)
 
-    private fun validateUrl(url: String) {
+    private fun validateUrl(url: String): URI {
         val uri = try {
             URI(url)
         } catch (invalid: URISyntaxException) {
@@ -42,6 +55,7 @@ class SubscriptionService(
             throw InvalidRequestException("url must be an absolute ${allowedSchemes.joinToString(" or ")} URL")
         }
         if (uri.userInfo != null) throw InvalidRequestException("url must not contain credentials")
+        return uri
     }
 
     private companion object {

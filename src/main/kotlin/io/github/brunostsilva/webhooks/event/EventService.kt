@@ -9,6 +9,7 @@ import java.security.MessageDigest
 import java.time.Clock
 import java.util.HexFormat
 import java.util.UUID
+import org.slf4j.LoggerFactory
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
 import tools.jackson.databind.JsonNode
@@ -26,6 +27,8 @@ class EventService(
     private val clock: Clock,
     private val properties: DispatcherProperties,
 ) {
+
+    private val log = LoggerFactory.getLogger(javaClass)
 
     /**
      * Stores the event and one delivery per matching subscription in the same transaction (the
@@ -55,7 +58,14 @@ class EventService(
             val original = checkNotNull(events.findByIdempotencyKey(idempotencyKey)) {
                 "no event for idempotency key $idempotencyKey"
             }
-            if (original.requestHash != requestHash) throw IdempotencyKeyReusedException(idempotencyKey)
+            if (original.requestHash != requestHash) {
+                log.atWarn()
+                    .setMessage("Idempotency-Key of event {} reused for a different request: rejected")
+                    .addArgument(original.id)
+                    .addKeyValue("webhook.event_id", original.id)
+                    .log()
+                throw IdempotencyKeyReusedException(idempotencyKey)
+            }
             return Publication(original, deliveries.countByEvent(original.id), replayed = true)
         }
 

@@ -6,6 +6,7 @@ import io.github.brunostsilva.webhooks.event.EventService
 import io.github.brunostsilva.webhooks.subscription.SubscriptionService
 import java.net.URI
 import java.util.UUID
+import org.slf4j.LoggerFactory
 import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.GetMapping
@@ -39,6 +40,8 @@ class EventController(
     private val signal: WorkerSignal,
 ) {
 
+    private val log = LoggerFactory.getLogger(javaClass)
+
     /**
      * 202 Accepted for a new event, delivered asynchronously; 200 OK with `Idempotent-Replayed: true`
      * when the same request was already accepted under this `Idempotency-Key`.
@@ -50,6 +53,24 @@ class EventController(
     ): ResponseEntity<EventResponse> {
         val publication = events.publish(idempotencyKey, request.type, request.data)
         if (!publication.replayed) signal.wake()
+        // Logged here, once the event and its deliveries are committed.
+        val event = publication.event
+        log.atInfo()
+            .setMessage(
+                if (publication.replayed) {
+                    "Event {} of type {} replayed for a repeated Idempotency-Key ({} delivery(ies))"
+                } else {
+                    "Event {} of type {} published with {} delivery(ies)"
+                },
+            )
+            .addArgument(event.id)
+            .addArgument(event.type)
+            .addArgument(publication.deliveries)
+            .addKeyValue("webhook.event_id", event.id)
+            .addKeyValue("webhook.event_type", event.type)
+            .addKeyValue("webhook.deliveries", publication.deliveries)
+            .addKeyValue("webhook.replayed", publication.replayed)
+            .log()
         return ResponseEntity.status(if (publication.replayed) HttpStatus.OK else HttpStatus.ACCEPTED)
             .header(IDEMPOTENT_REPLAYED, publication.replayed.toString())
             .body(EventResponse.of(publication))

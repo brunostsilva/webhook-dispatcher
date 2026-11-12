@@ -2,10 +2,12 @@
 kotlin = "2.4.21"
 spring-boot = "4.1.2"
 resilience4j = "2.4.0"
+disruptor = "4.0.0"
 
 [libraries]
 resilience4j-circuitbreaker = { module = "io.github.resilience4j:resilience4j-circuitbreaker", version.ref = "resilience4j" }
 resilience4j-micrometer = { module = "io.github.resilience4j:resilience4j-micrometer", version.ref = "resilience4j" }
+disruptor = { module = "com.lmax:disruptor", version.ref = "disruptor" }
 
 [plugins]
 kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }

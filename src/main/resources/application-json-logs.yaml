@@ -1,0 +1,9 @@
+# Opt-in profile: one JSON object per log line in Elastic Common Schema (ECS) instead of the readable
+# console pattern. ECS is an open format read by Elasticsearch/Kibana, OpenSearch, Grafana Loki,
+# Datadog, New Relic, Splunk and most log shippers, so no vendor library or agent is in the app.
+# The key-values logged with SLF4J's fluent API (event.id, delivery.id, http.status_code...) become
+# fields of their own.
+logging:
+  structured:
+    format:
+      console: ecs

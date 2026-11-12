@@ -35,6 +35,11 @@ tasks.named<KotlinCompile>("compileKotlin") {
     compilerOptions.allWarningsAsErrors = true
 }
 
+// Log4j2 instead of Spring Boot's default Logback, on every classpath (LoggingBackendTest checks it).
+configurations.configureEach {
+    exclude(group = "org.springframework.boot", module = "spring-boot-starter-logging")
+}
+
 dependencies {
     implementation(platform(SpringBootPlugin.BOM_COORDINATES))
 
@@ -43,6 +48,7 @@ dependencies {
     implementation("org.springframework.boot:spring-boot-starter-r2dbc")
     implementation("org.springframework.boot:spring-boot-starter-flyway")
     implementation("org.springframework.boot:spring-boot-starter-actuator")
+    implementation("org.springframework.boot:spring-boot-starter-log4j2")
     implementation("tools.jackson.module:jackson-module-kotlin")
     implementation("org.jetbrains.kotlin:kotlin-reflect")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-reactor")
@@ -53,6 +59,7 @@ dependencies {
     runtimeOnly("org.postgresql:r2dbc-postgresql")
     runtimeOnly("org.postgresql:postgresql") // Flyway migrates over JDBC; the application uses R2DBC
     runtimeOnly("io.micrometer:micrometer-registry-prometheus")
+    runtimeOnly(libs.disruptor) // Log4j2 async loggers (see log4j2.component.properties)
 
     testImplementation("org.springframework.boot:spring-boot-starter-test")
     testImplementation("org.springframework.boot:spring-boot-testcontainers")
